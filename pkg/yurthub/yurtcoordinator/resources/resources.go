@@ -24,8 +24,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -35,23 +38,27 @@ import (
 )
 
 type PoolScopeResourcesManger struct {
+	ctx                          context.Context
 	validPoolScopedResources     map[string]*verifiablePoolScopeResource
 	validPoolScopedResourcesLock sync.RWMutex
 	k8sClient                    kubernetes.Interface
+	dynamicClient                dynamic.Interface
 	hasSynced                    func() bool
 }
 
 var poolScopeResourcesManger *PoolScopeResourcesManger
 
-func InitPoolScopeResourcesManger(client kubernetes.Interface, factory informers.SharedInformerFactory) *PoolScopeResourcesManger {
+func InitPoolScopeResourcesManger(ctx context.Context, client kubernetes.Interface, dynamicClient dynamic.Interface, factory informers.SharedInformerFactory) *PoolScopeResourcesManger {
 	poolScopeResourcesManger = &PoolScopeResourcesManger{
+		ctx:                      ctx,
 		k8sClient:                client,
+		dynamicClient:            dynamicClient,
 		validPoolScopedResources: make(map[string]*verifiablePoolScopeResource),
 	}
 	configmapInformer := factory.Core().V1().ConfigMaps().Informer()
 	configmapInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: poolScopeResourcesManger.addConfigmap,
-		// todo: now we do not support update of pool scope resources definition
+		AddFunc:    poolScopeResourcesManger.addConfigmap,
+		UpdateFunc: poolScopeResourcesManger.updateConfigmap,
 	})
 	poolScopeResourcesManger.hasSynced = configmapInformer.HasSynced
 
@@ -145,6 +152,62 @@ func (m *PoolScopeResourcesManger) addConfigmap(obj interface{}) {
 	m.addVerifiableGVRs(verifiablePoolScopeResourcesGVRs...)
 }
 
+func (m *PoolScopeResourcesManger) updateConfigmap(oldObj interface{}, newObj interface{}) {
+	newcfg, newOk := newObj.(*corev1.ConfigMap)
+	if !newOk {
+		return
+	}
+	klog.Infof("Update pool coordinator configmap %s/%s", newcfg.GetName(), newcfg.GetNamespace())
+	cfg, err := m.k8sClient.CoreV1().ConfigMaps(newcfg.Namespace).Get(context.TODO(), newcfg.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return
+	}
+	poolScopeResources := cfg.Data[util.PoolScopeResourcesKey]
+	poolScopeResourcesGVRs := make([]schema.GroupVersionResource, 0)
+	klog.Infof("Update pool coordinator configmap %s/%s with poolScopeResources: %s", cfg.GetName(), cfg.GetNamespace(), poolScopeResources)
+	if err := json.Unmarshal([]byte(poolScopeResources), &poolScopeResourcesGVRs); err != nil {
+		klog.Errorf("PoolScopeResourceManager unmarshall poolScopeResources %s failed with error = %s",
+			poolScopeResources, err.Error())
+		return
+	}
+	verifiablePoolScopeResourcesGVRs := make([]*verifiablePoolScopeResource, 0)
+	klog.Infof("PoolScopeResourceManager update configured pool scope resources %v", poolScopeResourcesGVRs)
+	for _, v := range poolScopeResourcesGVRs {
+		if _, ok := m.validPoolScopedResources[v.String()]; ok {
+			continue
+		}
+		verifiablePoolScopeResourcesGVRs = append(verifiablePoolScopeResourcesGVRs,
+			newVerifiablePoolScopeResource(v, m.getGroupVersionVerifyFunction(m.k8sClient)))
+	}
+	m.addVerifiableGVRs(verifiablePoolScopeResourcesGVRs...)
+	m.addVerifiedGVRsInformerCacheSync(verifiablePoolScopeResourcesGVRs...)
+}
+
+// dynamic trigger gvr resources cache sync, with trigger list operations
+func (m *PoolScopeResourcesManger) addVerifiedGVRsInformerCacheSync(gvrs ...*verifiablePoolScopeResource) {
+	hasInformersSynced := []cache.InformerSynced{}
+	dynamicInformerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(m.dynamicClient, 0, metav1.NamespaceAll, nil)
+	for _, vGvr := range gvrs {
+		if ok, errMsg := vGvr.Verify(); ok {
+			gvr := schema.GroupVersionResource{
+				Group:    vGvr.Group,
+				Version:  vGvr.Version,
+				Resource: vGvr.Resource,
+			}
+			informer := dynamicInformerFactory.ForResource(gvr)
+			hasInformersSynced = append(hasInformersSynced, informer.Informer().HasSynced)
+			klog.Infof("PoolScopeResourceManager ")
+		} else {
+			klog.Warningf("PoolScopeResourcesManager add gvr %s cache sync failed, because %s",
+				vGvr.String(), errMsg)
+		}
+	}
+	dynamicInformerFactory.Start(m.ctx.Done())
+	if synced := cache.WaitForCacheSync(m.ctx.Done(), hasInformersSynced...); !synced {
+		klog.Warningf("PoolScopeResourcesManager add gvr wait for cache sync failed")
+	}
+}
+
 func (m *PoolScopeResourcesManger) getGroupVersionVerifyFunction(client kubernetes.Interface) func(gvr schema.GroupVersionResource) (bool, string) {
 	return func(gvr schema.GroupVersionResource) (bool, string) {
 		maxRetry := 3
@@ -176,6 +239,9 @@ func (m *PoolScopeResourcesManger) getInitPoolScopeResources() []*verifiablePool
 			m.getGroupVersionVerifyFunction(m.k8sClient)),
 		newVerifiablePoolScopeResource(
 			schema.GroupVersionResource{Group: "discovery.k8s.io", Version: "v1beta1", Resource: "endpointslices"},
+			m.getGroupVersionVerifyFunction(m.k8sClient)),
+		newVerifiablePoolScopeResource(
+			schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"},
 			m.getGroupVersionVerifyFunction(m.k8sClient)),
 	}
 }

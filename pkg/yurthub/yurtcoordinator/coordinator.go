@@ -191,13 +191,13 @@ func NewCoordinator(
 		return nil, fmt.Errorf("failed to create proxied client, %v", err)
 	}
 
-	// init pool scope resources
-	resources.InitPoolScopeResourcesManger(proxiedClient, cfg.SharedFactory)
-
 	dynamicClient, err := buildDynamicClientWithUserAgent(fmt.Sprintf("http://%s", cfg.YurtHubProxyServerAddr), constants.DefaultPoolScopedUserAgent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dynamic client, %v", err)
 	}
+
+	// init pool scope resources
+	resources.InitPoolScopeResourcesManger(ctx, proxiedClient, dynamicClient, cfg.SharedFactory)
 
 	poolScopedCacheSyncManager := &poolScopedCacheSyncManager{
 		ctx:               ctx,
